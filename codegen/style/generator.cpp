@@ -1100,6 +1100,68 @@ QByteArray iconMaskValueSize(int width, int height) {
 	return result;
 }
 
+// 翻转修饰符对 svg 以 transform 实现，这里只负责识别名字。
+[[nodiscard]] bool IsFlipModifier(const QString &name) {
+	return (name == "flip_horizontal") || (name == "flip_vertical");
+}
+
+// 同一 svg 的不同翻转组合必须各自内嵌一份，故并入去重键。
+[[nodiscard]] QString iconMaskSvgFlips(const QString &filepath) {
+	auto result = QStringList();
+	const auto modifiers = QFileInfo(filepath).fileName().split('-').mid(1);
+	for (const auto &modifierName : modifiers) {
+		if (IsFlipModifier(modifierName)) {
+			result.push_back(modifierName);
+		}
+	}
+	result.sort();
+	return result.join('-');
+}
+
+[[nodiscard]] QString iconMaskSvgKey(const QString &filepath) {
+	const auto path = iconMaskSvgPath(filepath);
+	if (path.isEmpty()) {
+		return QString();
+	}
+	const auto flips = iconMaskSvgFlips(filepath);
+	return flips.isEmpty() ? path : (path + '|' + flips);
+}
+
+// 在根标签内套一层翻转用的 g，镜像轴取 viewBox 中心。
+[[nodiscard]] QByteArray WrapSvgFlips(
+		const QByteArray &bytes,
+		const QRectF &viewBox,
+		bool flipHorizontal,
+		bool flipVertical) {
+	const auto open = bytes.indexOf('>', bytes.indexOf("<svg"));
+	const auto close = bytes.lastIndexOf("</svg");
+	if (open < 0 || close < open) {
+		return {};
+	}
+	const auto sx = flipHorizontal ? -1 : 1;
+	const auto sy = flipVertical ? -1 : 1;
+	const auto tx = flipHorizontal
+		? (2 * viewBox.x() + viewBox.width())
+		: 0.;
+	const auto ty = flipVertical
+		? (2 * viewBox.y() + viewBox.height())
+		: 0.;
+	const auto transform = QString("translate(%1 %2) scale(%3 %4)")
+		.arg(tx, 0, 'f', 4)
+		.arg(ty, 0, 'f', 4)
+		.arg(sx)
+		.arg(sy);
+	auto result = QByteArray();
+	result.append(bytes.constData(), open + 1);
+	result.append("<g transform=\"");
+	result.append(transform.toUtf8());
+	result.append("\">");
+	result.append(bytes.constData() + open + 1, close - open - 1);
+	result.append("</g>");
+	result.append(bytes.constData() + close, bytes.size() - close);
+	return result;
+}
+
 QByteArray iconMaskValueSvg(QString filepath) {
 	QFileInfo fileInfo(filepath);
 	auto directory = fileInfo.dir();
@@ -1113,18 +1175,38 @@ QByteArray iconMaskValueSvg(QString filepath) {
 		common::logError(common::kErrorFileNotOpened, path) << "could not open icon file";
 		return {};
 	}
-	const auto bytes = file.readAll();
+	auto bytes = file.readAll();
 	file.close();
-	if (!QSvgRenderer(bytes).isValid()) {
+	auto renderer = QSvgRenderer(bytes);
+	if (!renderer.isValid()) {
 		common::logError(common::kErrorFileNotOpened, path) << "invalid svg data";
 		return {};
 	}
+	auto flipHorizontal = false;
+	auto flipVertical = false;
 	for (const auto &modifierName : modifiers) {
-		if (const auto modifier = GetModifier(modifierName)) {
-			common::logError(common::kErrorInternal, filepath) << "modifiers not supported for svg yet";
+		if (IsFlipModifier(modifierName)) {
+			if (modifierName == "flip_horizontal") {
+				flipHorizontal = !flipHorizontal;
+			} else {
+				flipVertical = !flipVertical;
+			}
+		} else if (GetModifier(modifierName)) {
+			common::logError(common::kErrorInternal, filepath) << "modifier not supported for svg: " << modifierName.toStdString();
 			return {};
 		} else if (!GetSizeModifier(modifierName)) {
 			common::logError(common::kErrorInternal, filepath) << "modifier should be valid here, name: " << modifierName.toStdString();
+			return {};
+		}
+	}
+	if (flipHorizontal || flipVertical) {
+		bytes = WrapSvgFlips(
+			bytes,
+			renderer.viewBoxF(),
+			flipHorizontal,
+			flipVertical);
+		if (bytes.isEmpty() || !QSvgRenderer(bytes).isValid()) {
+			common::logError(common::kErrorInternal, path) << "could not apply flip modifiers";
 			return {};
 		}
 	}
@@ -1231,11 +1313,11 @@ bool Generator::writeIconValues() {
 				return false;
 			}
 			maskData = iconMaskValueSize(dimensions.at(0).toInt(), dimensions.at(1).toInt());
-		} else if (const auto svgPath = iconMaskSvgPath(filePath); !svgPath.isEmpty()) {
-			if (svgDataOwners.contains(svgPath)) {
+		} else if (const auto svgKey = iconMaskSvgKey(filePath); !svgKey.isEmpty()) {
+			if (svgDataOwners.contains(svgKey)) {
 				continue;
 			}
-			svgDataOwners.insert(svgPath, i.value());
+			svgDataOwners.insert(svgKey, i.value());
 			maskData = iconMaskValueSvg(filePath);
 		} else {
 			maskData = iconMaskValuePng(filePath);
@@ -1249,8 +1331,8 @@ bool Generator::writeIconValues() {
 		const auto filePath = i.key();
 		auto dataIndex = i.value();
 		auto sizeArgument = QString();
-		if (const auto svgPath = iconMaskSvgPath(filePath); !svgPath.isEmpty()) {
-			dataIndex = svgDataOwners.value(svgPath, dataIndex);
+		if (const auto svgKey = iconMaskSvgKey(filePath); !svgKey.isEmpty()) {
+			dataIndex = svgDataOwners.value(svgKey, dataIndex);
 			if (const auto size = iconMaskSizeModifier(filePath); !size.isEmpty()) {
 				sizeArgument = QString(", { %1, %2 }").arg(size.width()).arg(size.height());
 			}
